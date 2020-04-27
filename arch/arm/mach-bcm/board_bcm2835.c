@@ -26,9 +26,6 @@
 
 #include "platsmp.h"
 
-#define BCM2835_USB_VIRT_BASE   (VMALLOC_START)
-#define BCM2835_USB_VIRT_MPHI   (VMALLOC_START + 0x10000)
-
 static void __init bcm2835_init(void)
 {
 	struct device_node *np = of_find_node_by_path("/system");
@@ -42,6 +39,42 @@ static void __init bcm2835_init(void)
 }
 
 /*
+ * fiq_map_check_node() - check if #size-cells, #address-cells provided
+ * matches the values supported by the current implementation,
+ */
+static int __init fiq_map_check_node(unsigned long node)
+{
+    const char *status;
+    const __be32 *prop;
+
+    /* not currently checking #size-cells as many entries contain
+     * #size-cells <0> rather than <1>.
+     */
+    // prop = of_get_flat_dt_prop(node, "#size-cells", NULL);
+    // if (prop && be32_to_cpup(prop) != dt_root_size_cells) {
+	//     pr_err("FIQ Premap: 1, size: %d. Expected %d.\n", be32_to_cpup(prop), dt_root_size_cells);
+    //     return -EINVAL;
+    // }
+
+    prop = of_get_flat_dt_prop(node, "#address-cells", NULL);
+    if (prop && be32_to_cpup(prop) != dt_root_addr_cells) {
+        return -EINVAL;
+    }
+
+    status = of_get_flat_dt_prop(node, "status", NULL);
+    if (status && strcmp(status, "ok") && strcmp(status, "okay")) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+// TODO: potentially track previous allocation to minimise repeated
+// allocations of small blocks within same page?
+struct fiq_map_config {
+    unsigned long next_free;
+    unsigned long p2b_offset;
+};
+/*
  * We need to map registers that are going to be accessed by the FIQ
  * very early, before any kernel threads are spawned. Because if done
  * later, the mapping tables are not updated instantly but lazily upon
@@ -52,36 +85,70 @@ static void __init bcm2835_init(void)
  * For more background see the following old mailing list thread:
  * https://www.spinics.net/lists/arm-kernel/msg325250.html
  */
-static int __init bcm2835_map_usb(unsigned long node, const char *uname,
-					int depth, void *data)
+static int __init bcm2835_map_fiq(unsigned long node, const char *uname,
+                    int depth, void *data)
 {
-	struct map_desc map[2];
-	const __be32 *reg;
-	int len;
-	unsigned long p2b_offset = *((unsigned long *) data);
+    struct map_desc map[1];
+    const __be32 *reg;
+    int len;
+    u64 base, size;
+    struct fiq_map_config *fmc = data;
+    int t_len = (dt_root_addr_cells + dt_root_size_cells) * sizeof(__be32);
 
-	if (!of_flat_dt_is_compatible(node, "brcm,bcm2708-usb"))
-		return 0;
+    if (of_get_flat_dt_prop(node, "raspberrypi,fiq-premap", NULL) == NULL) {
+        return 0;
+    }
+	if (fiq_map_check_node(node)) {
+	    pr_err("FIQ Premap: unsupported node format in %s, ignoring\n", uname);
+	    return 0;
+	}
 	reg = of_get_flat_dt_prop(node, "reg", &len);
-	if (!reg || len != (sizeof(unsigned long) * 4))
+	if (!reg) {
+	    pr_err("FIQ Premap: no reg entry found in %s, skipping node\n", uname);
 		return 0;
+	}
+	if (len && len % t_len != 0) {
+	    pr_err("FIQ Premap: invalid reg property in '%s', skipping node.", uname);
+	    return 0;
+	}
 
-	/* Use information about the physical addresses of the
-	 * registers from the device tree, but use legacy
-	 * iotable_init() static mapping function to map them,
-	 * as ioremap() is not functional at this stage in boot.
-	 */
-	map[0].virtual = (unsigned long) BCM2835_USB_VIRT_BASE;
-	map[0].pfn = __phys_to_pfn(be32_to_cpu(reg[0]) - p2b_offset);
-	map[0].length = be32_to_cpu(reg[1]);
-	map[0].type = MT_DEVICE;
-	map[1].virtual = (unsigned long) BCM2835_USB_VIRT_MPHI;
-	map[1].pfn = __phys_to_pfn(be32_to_cpu(reg[2]) - p2b_offset);
-	map[1].length = be32_to_cpu(reg[3]);
-	map[1].type = MT_DEVICE;
-		iotable_init(map, 2);
+	pr_err("FIQ premap node %s, reg size %d. Item len = %d.\n", uname, len, t_len);
 
-	return 1;
+	while (len >= t_len) {
+	    base = dt_mem_next_cell(dt_root_addr_cells, &reg) - fmc->p2b_offset;
+	    size = dt_mem_next_cell(dt_root_size_cells, &reg);
+
+	    if (size == 0) {
+	        pr_err("FIQ premap node size 0, skipping\n");
+	        continue;
+	    }
+	    pr_err("FIQ premap mapping - %llx ,  len %llx. Mapping to %lx.\n", (unsigned long long)base,
+	        (unsigned long long)size, fmc->next_free);
+	    /*
+	     * pre-align allocation so we can keep track of where next
+	     * allocation begins
+	     */
+	    size = PAGE_ALIGN(size + (base & ~PAGE_MASK));
+	    base &= PAGE_MASK;
+	    pr_err("FIQ premap mapping aligned - %llx ,  len %llx.\n", (unsigned long long)base,
+	        (unsigned long long)size);
+
+	    /* Use information about the physical addresses of the
+	     * registers from the device tree, but use legacy
+	     * iotable_init() static mapping function to map them,
+	     * as ioremap() is not functional at this stage in boot.
+	     */
+	    map[0].virtual = fmc->next_free;
+	    map[0].pfn = __phys_to_pfn(base);
+	    map[0].length = size;
+	    map[0].type = MT_DEVICE;
+	    iotable_init(map, 1);
+
+	    fmc->next_free += PAGE_ALIGN(size);
+	    len -= t_len;
+	}
+	// TODO: return 1 means we only map one device right??
+	return 0;
 }
 
 static void __init bcm2835_map_io(void)
@@ -89,7 +156,7 @@ static void __init bcm2835_map_io(void)
 	const __be32 *ranges, *address_cells;
 	unsigned long root, addr_cells;
 	int soc, len;
-	unsigned long p2b_offset;
+	struct fiq_map_config fmc;
 
 	debug_ll_io_init();
 
@@ -105,10 +172,12 @@ static void __init bcm2835_map_io(void)
 	ranges = of_get_flat_dt_prop(soc, "ranges", &len);
 	if (!ranges || len < (sizeof(unsigned long) * (2 + addr_cells)))
 		return;
-	p2b_offset = be32_to_cpu(ranges[0]) - be32_to_cpu(ranges[addr_cells]);
+	fmc.p2b_offset = be32_to_cpu(ranges[0]) - be32_to_cpu(ranges[addr_cells]);
 
 	/* Now search for bcm2708-usb node in device tree */
-	of_scan_flat_dt(bcm2835_map_usb, &p2b_offset);
+	fmc.next_free = VMALLOC_START;
+	of_scan_flat_dt(bcm2835_map_fiq, &fmc);
+	pr_err("FIQ premapping complete. Next free address is %lx.\n", fmc.next_free);
 }
 
 static const char * const bcm2835_compat[] = {
